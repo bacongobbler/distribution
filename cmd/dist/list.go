@@ -2,19 +2,16 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
-	"path"
-	"strings"
-	"text/tabwriter"
-	"time"
 
-	"github.com/codegangsta/cli"
+	"github.com/docker/distribution/reference"
+
 	ctxu "github.com/docker/distribution/context"
-	"github.com/docker/distribution/digest"
 	"github.com/docker/distribution/registry/storage"
-	"github.com/docker/distribution/registry/storage/driver"
 	"github.com/docker/distribution/registry/storage/driver/filesystem"
-	"github.com/dustin/go-humanize"
+	"github.com/olekukonko/tablewriter"
+	"github.com/urfave/cli"
 	"golang.org/x/net/context"
 )
 
@@ -27,101 +24,58 @@ var (
 )
 
 func imageList(c *cli.Context) {
-	driver := filesystem.New("/tmp/local-registry")
-	local := storage.NewRegistryWithDriver(driver)
 	ctx := context.Background()
 
-	wr := tabwriter.NewWriter(os.Stdout, 0, 8, 0, '\t', 0)
-	fmt.Fprintf(wr, "REPOSITORY\tTAG\tIMAGE ID\tCREATED\tVIRTUAL SIZE\n")
+	driver := filesystem.New(filesystem.DriverParameters{
+		RootDirectory: "/var/lib/registry",
+		MaxThreads:    1,
+	})
 
-	prefix := "/docker/registry/v2/repositories"
+	local, err := storage.NewRegistry(ctx, driver)
+	if err != nil {
+		fmt.Println(err.Error())
+		os.Exit(1)
+	}
 
-	// TODO(stevvooe): Need way to list repositories
-	walk(driver, prefix, func(p string) error {
-		if strings.HasPrefix(path.Base(p), "_") {
-			return fmt.Errorf("stop")
+	table := tablewriter.NewWriter(os.Stdout)
+	table.SetHeader([]string{"REPOSITORY", "TAG", "DIGEST"})
+
+	// limit ourselves to showing 100 images
+	repos := make([]string, 100)
+
+	n, err := local.Repositories(ctx, repos, "")
+	if err != nil {
+		if err != io.EOF {
+			ctxu.GetLogger(ctx).Fatalf("error getting repositories: %v", err)
 		}
+	}
 
-		name := strings.TrimPrefix(p, prefix+"/")
-		if strings.Count(name, "/") < 1 {
-			return nil
-		}
-
-		repo, err := local.Repository(ctx, name)
+	for i := 0; i < n; i++ {
+		namedRepo, err := reference.WithName(repos[i])
 		if err != nil {
-			ctxu.GetLogger(ctx).Fatalf("error getting repository: %v", err)
+			ctxu.GetLogger(ctx).Fatalf("error getting a named reference: %v", err)
+		}
+		repo, err := local.Repository(ctx, namedRepo)
+		if err != nil {
+			ctxu.GetLogger(ctx).Fatalf("error getting repository %s: %v", namedRepo.Name(), err)
 		}
 
-		tags, err := repo.Manifests().Tags()
+		tagService := repo.Tags(ctx)
+
+		tags, err := tagService.All(ctx)
 		if err != nil {
 			ctxu.GetLogger(ctx).Fatalf("error reading tags: %v", err)
 		}
 
 		for _, tag := range tags {
-			sm, err := repo.Manifests().Get(tag)
+			descriptor, err := tagService.Get(ctx, tag)
 			if err != nil {
-				ctxu.GetLogger(ctx).Fatalf("error getting manifest: %v", err)
+				ctxu.GetLogger(ctx).Errorf("error retrieving tag descriptor for %s: %v", tag, err)
+				continue
 			}
-
-			dgst, err := digest.FromBytes(sm.Raw)
-			if err != nil {
-				ctxu.GetLogger(ctx).Fatalf("error digesting manifest: %v", err)
-			}
-
-			created := time.Time{}
-			var size int64
-
-			for _, fsLayer := range sm.FSLayers {
-				layer, err := repo.Layers().Fetch(fsLayer.BlobSum)
-				if err != nil {
-					ctxu.GetLogger(ctx).Fatalf("error fetching layer: %v", err)
-				}
-
-				if created.Before(layer.CreatedAt()) {
-					created = layer.CreatedAt()
-				}
-
-				ls, err := layer.Seek(0, os.SEEK_END)
-				if err != nil {
-					ctxu.GetLogger(ctx).Fatalf("error seeking layer: %v", err)
-				}
-
-				size += ls
-			}
-
-			fmt.Fprintf(wr, "%s\t%s\t%s\t%s\t%s\n", name, tag, dgst, humanize.Time(created), humanize.Bytes(uint64(size)))
-		}
-		wr.Flush()
-
-		return nil
-	})
-
-}
-
-func walk(driver driver.StorageDriver, path string, fn func(path string) error) error {
-	fi, err := driver.Stat(path)
-	if err != nil {
-		return err
-	}
-
-	if !fi.IsDir() {
-		return nil
-	}
-
-	entries, err := driver.List(path)
-	if err != nil {
-		return err
-	}
-
-	for _, entry := range entries {
-		if err := fn(entry); err != nil {
-			continue // just skip
-		}
-
-		if err := walk(driver, entry, fn); err != nil {
-			return err
+			table.Append([]string{namedRepo.Name(), tag, descriptor.Digest.String()})
 		}
 	}
 
-	return nil
+	table.Render()
 }

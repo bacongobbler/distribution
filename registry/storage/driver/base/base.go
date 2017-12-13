@@ -135,8 +135,8 @@ func (base *Base) Writer(ctx context.Context, path string, append bool) (storage
 
 // Stat wraps Stat of underlying storage driver.
 func (base *Base) Stat(ctx context.Context, path string) (storagedriver.FileInfo, error) {
-	ctx, done := dcontext.WithTrace(ctx)
-	defer done("%s.Stat(%q)", base.Name(), path)
+	// ctx, _ := dcontext.WithTrace(ctx)
+	// defer done("%s.Stat(%q)", base.Name(), path)
 
 	if !storagedriver.PathRegexp.MatchString(path) && path != "/" {
 		return nil, storagedriver.InvalidPathError{Path: path, DriverName: base.StorageDriver.Name()}

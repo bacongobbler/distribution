@@ -7,12 +7,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 
-	"github.com/codegangsta/cli"
+	"github.com/docker/distribution"
+	"github.com/docker/distribution/manifest/schema2"
+	"github.com/docker/distribution/reference"
+	digest "github.com/opencontainers/go-digest"
+
 	ctxu "github.com/docker/distribution/context"
 	"github.com/docker/distribution/registry/storage"
 	"github.com/docker/distribution/registry/storage/driver/filesystem"
+	"github.com/urfave/cli"
 	"golang.org/x/net/context"
 )
 
@@ -21,13 +25,6 @@ var (
 		Name:   "mount",
 		Usage:  "Mount the image at path",
 		Action: mount,
-		Flags: []cli.Flag{
-			cli.StringFlag{
-				Name:  "r,registry",
-				Value: "hub.docker.io",
-				Usage: "Registry to use (e.g.: localhost:5000)",
-			},
-		},
 	}
 )
 
@@ -49,38 +46,70 @@ func mount(c *cli.Context) {
 		ctxu.GetLogger(ctx).Fatalln("mount path should be a directory")
 	}
 
-	local := storage.NewRegistryWithDriver(filesystem.New("/tmp/local-registry"))
-	name, tag, revision := splitNameTag(image)
+	storageDriver := filesystem.New(filesystem.DriverParameters{
+		RootDirectory: "/var/lib/registry",
+		MaxThreads:    1,
+	})
 
-	repo, err := local.Repository(ctx, name)
+	local, err := storage.NewRegistry(ctx, storageDriver)
+	if err != nil {
+		ctxu.GetLogger(ctx).Fatalf("could not create a local registry: %v\n", err)
+	}
+
+	namedRepo, err := reference.WithName(image)
+	if err != nil {
+		ctxu.GetLogger(ctx).Fatalf("could not get a name: %v\n", err)
+	}
+
+	repo, err := local.Repository(ctx, namedRepo)
 	if err != nil {
 		ctxu.GetLogger(ctx).Fatalln(err)
 	}
 
-	sm, err := repo.Manifests().Get(tag)
+	manifests, err := repo.Manifests(ctx)
 	if err != nil {
-		ctxu.GetLogger(ctx).Fatalln(err)
+		ctxu.GetLogger(ctx).Fatalf("could not get manifests: %v\n", err)
 	}
 
-	ls := repo.Layers()
-	for i := len(sm.FSLayers) - 1; i >= 0; i-- {
-		ctxu.GetLogger(ctx).Infof("unpack %v", sm.FSLayers[i].BlobSum)
-		layer, err := ls.Fetch(sm.FSLayers[i].BlobSum)
+	manifestEnumerator, ok := manifests.(distribution.ManifestEnumerator)
+	if !ok {
+		ctxu.GetLogger(ctx).Fatalln("unable to convert ManifestService into ManifestEnumerator")
+	}
+
+	err = manifestEnumerator.Enumerate(ctx, func(dgst digest.Digest) error {
+
+		manifest, err := manifests.Get(ctx, dgst)
 		if err != nil {
-
-			ctxu.GetLogger(ctx).Fatalln(err)
+			return fmt.Errorf("failed to retrieve manifest for digest %v: %v", dgst, err)
 		}
 
-		if err := extractTarFile(ctx, mountPath, layer); err != nil {
-			ctxu.GetLogger(ctx).Infof("error extracting tar: %v", err)
+		descriptors := manifest.References()
+		for _, descriptor := range descriptors {
+			// skip media types which are not part of the layer
+			if descriptor.MediaType != schema2.MediaTypeLayer {
+				continue
+			}
+			blob, err := repo.Blobs(ctx).Open(ctx, descriptor.Digest)
+			if err != nil {
+				return fmt.Errorf("could not open blob with digest %s: %v", dgst, err)
+			}
+			defer blob.Close()
+
+			if err := extractTarFile(ctx, mountPath, blob); err != nil {
+				return fmt.Errorf("error extracting tar: %v", err)
+			}
 		}
+		return nil
+	})
+
+	if err != nil {
+		ctxu.GetLogger(ctx).Fatalln(err)
 	}
-
-	fmt.Println(mountPath, revision)
+	fmt.Println("done")
 }
 
 func extractTarFile(ctx context.Context, path string, rd io.Reader) error {
-	cmd := exec.Command("tar", "-x", "-C", path) // may need some extra options for users/permissions
+	cmd := exec.Command("tar", "-x", "-z", "-C", path) // may need some extra options for users/permissions
 	cmd.Stdin = rd
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -115,29 +144,4 @@ func writeTarFile(ctx context.Context, path string, hdr *tar.Header, rd io.Reade
 	}
 
 	return nil
-}
-
-func splitNameTag(raw string) (name, tag, revision string) {
-	name = raw
-	if strings.Contains(name, "@") {
-		parts := strings.Split(name, "@")
-		if len(parts) != 2 {
-			panic("bad name")
-		}
-		name = parts[0]
-		revision = parts[1]
-	}
-
-	if strings.Contains(name, ":") {
-		parts := strings.Split(name, ":")
-
-		if len(parts) != 2 {
-			panic("bad name")
-		}
-
-		name = parts[0]
-		tag = parts[1]
-	}
-
-	return
 }

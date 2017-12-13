@@ -3,8 +3,8 @@ package main
 import (
 	"os"
 
-	"github.com/Sirupsen/logrus"
-	"github.com/codegangsta/cli"
+	"github.com/sirupsen/logrus"
+	"github.com/urfave/cli"
 )
 
 func main() {
@@ -16,11 +16,7 @@ func main() {
 	app.Action = commandList.Action
 	app.Commands = []cli.Command{
 		commandList,
-		commandPull,
-		commandPush,
 		commandMount,
-		commandSnapshot,
-		commandPack,
 	}
 
 	app.RunAndExitOnError()
